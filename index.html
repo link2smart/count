@@ -14,6 +14,13 @@
     
     <!-- Babel -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- PDF.js (Nouvelle librairie pour l'extraction locale) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        // Configuration du Worker PDF.js
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
     
     <style>
         @media print {
@@ -24,7 +31,6 @@
             .break-inside-avoid { break-inside: avoid; }
         }
         .print-only { display: none; }
-        .glass-panel { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }
     </style>
 </head>
 <body class="bg-slate-100 text-slate-800 font-sans min-h-screen">
@@ -62,39 +68,48 @@
         const formatDate = (date) => date ? date.toLocaleDateString('fr-FR') : '-';
         const formatCurrency = (amount) => new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR' }).format(amount);
 
-        // --- MOTEUR GEMINI ---
-        const analyzePdfWithGemini = async (file, apiKey, modelId) => {
-            const base64Data = await new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                reader.onerror = reject;
-                reader.readAsDataURL(file);
-            });
+        // --- NOUVEAU MOTEUR D'EXTRACTION (LOCAL) ---
+        const extractTextFromPdf = async (file) => {
+            const arrayBuffer = await file.arrayBuffer();
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            
+            let fullText = "";
+            for (let i = 1; i <= pdf.numPages; i++) {
+                const page = await pdf.getPage(i);
+                const textContent = await page.getTextContent();
+                // On joint les items par un espace pour garder une certaine structure
+                const pageText = textContent.items.map(item => item.str).join(' ');
+                fullText += `--- PAGE ${i} ---\n${pageText}\n`;
+            }
+            return fullText;
+        };
 
+        // --- MOTEUR GEMINI (TEXTE -> JSON) ---
+        const analyzeTextWithGemini = async (textData, apiKey, modelId) => {
             const prompt = `
-                Tu es un expert comptable AI. Analyse ce document (Grand Livre ou Extrait de Compte).
-                Extrait TOUTES les lignes de mouvement comptable.
-                Pour chaque ligne, identifie :
-                - Date : date de l'opération (JJ/MM/AAAA)
-                - Libellé : description
-                - Pièce : numéro de pièce/facture
-                - Lettrage : le code lettre si présent (ex: A, B, C...)
-                - Échéance : date d'échéance si présente (sinon mettre la date de l'opération)
-                - Débit : montant débit (0 si crédit)
-                - Crédit : montant crédit (0 si débit)
-
-                Règles importantes :
-                1. Ignore les lignes de report à nouveau (RAN) si elles n'ont pas de date précise ou sont des totaux.
-                2. Ignore les sous-totaux et totaux généraux.
-                3. Sortie STRICTEMENT au format JSON : un tableau d'objets.
-                4. Clés JSON : "date", "libelle", "piece", "lettre", "echeance", "debit", "credit".
-                5. Les montants doivent être des nombres (float), pas de string avec devises.
+                Tu es un expert comptable. Analyse le texte brut extrait d'un Grand Livre Client ci-dessous.
+                Extrait TOUTES les lignes de mouvement comptable pertinentes.
                 
-                Exemple de sortie :
-                [
-                    {"date": "01/01/2025", "libelle": "Facture F100", "piece": "FAC100", "lettre": "A", "echeance": "30/01/2025", "debit": 1000.0, "credit": 0},
-                    {"date": "15/01/2025", "libelle": "Virement", "piece": "VIR001", "lettre": "A", "echeance": "15/01/2025", "debit": 0, "credit": 1000.0}
-                ]
+                Données fournies :
+                ${textData.substring(0, 30000)} // Limite pour éviter de casser le prompt si trop long
+
+                Instructions :
+                1. Repère les lignes contenant une date, un libellé et un montant.
+                2. Ignore les totaux, sous-totaux et reports à nouveau non datés.
+                3. Identifie bien les colonnes DÉBIT et CRÉDIT.
+                4. Pour le "Lettrage", cherche des codes courts (A, B, AA...) souvent en fin de ligne ou près du montant.
+                5. Renvoie UNIQUEMENT un tableau JSON valide.
+
+                Format JSON attendu pour chaque ligne :
+                {
+                    "date": "JJ/MM/AAAA",
+                    "libelle": "string",
+                    "piece": "string (numéro facture/pièce)",
+                    "lettre": "string (laisser vide si absent)",
+                    "echeance": "JJ/MM/AAAA (si absente, mettre date opération)",
+                    "debit": number (0 si crédit),
+                    "credit": number (0 si débit)
+                }
             `;
 
             const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
@@ -103,12 +118,7 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    contents: [{
-                        parts: [
-                            { text: prompt },
-                            { inlineData: { mimeType: "application/pdf", data: base64Data } }
-                        ]
-                    }]
+                    contents: [{ parts: [{ text: prompt }] }]
                 })
             });
 
@@ -122,8 +132,16 @@
             
             if (!textResponse) throw new Error("Réponse vide de l'IA");
 
+            // Nettoyage des balises markdown json
             const jsonStr = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
-            return JSON.parse(jsonStr);
+            
+            // Tentative de parsing
+            try {
+                return JSON.parse(jsonStr);
+            } catch (e) {
+                console.error("Erreur parsing JSON:", jsonStr);
+                throw new Error("L'IA a renvoyé un format invalide. Réessayez.");
+            }
         };
 
         // --- COMPOSANT PRINCIPAL ---
@@ -143,8 +161,7 @@
             const models = [
                 { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (Recommandé)' },
                 { id: 'gemini-1.5-flash-latest', name: 'Gemini 1.5 Flash (Latest)' },
-                { id: 'gemini-1.5-flash-001', name: 'Gemini 1.5 Flash (Stable 001)' },
-                { id: 'gemini-1.5-flash-8b', name: 'Gemini 1.5 Flash (8b - Rapide)' },
+                { id: 'gemini-1.5-flash-001', name: 'Gemini 1.5 Flash (Stable)' },
                 { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (Plus puissant)' }
             ];
 
@@ -159,17 +176,26 @@
                 if (!file) return;
 
                 setStep('analyzing');
-                setLogs(`Utilisation du modèle : ${selectedModel}...`);
+                setLogs("Extraction du texte du PDF en local...");
                 setError(null);
                 
                 const cleanName = file.name.replace('.pdf', '').replace(/_/g, ' ').toUpperCase();
                 setClientName(cleanName);
 
                 try {
-                    setLogs("Envoi à Gemini AI pour extraction des données...");
-                    const rawData = await analyzePdfWithGemini(file, apiKey, selectedModel);
+                    // ÉTAPE 1 : Extraction Locale
+                    const pdfText = await extractTextFromPdf(file);
                     
-                    setLogs(`Données extraites : ${rawData.length} lignes trouvées. Calcul des KPIs...`);
+                    if (!pdfText || pdfText.length < 50) {
+                        throw new Error("Impossible de lire le texte du PDF. Document scanné ?");
+                    }
+
+                    setLogs(`Texte extrait (${pdfText.length} caractères). Analyse IA en cours avec ${selectedModel}...`);
+
+                    // ÉTAPE 2 : Analyse IA du texte
+                    const rawData = await analyzeTextWithGemini(pdfText, apiKey, selectedModel);
+                    
+                    setLogs(`${rawData.length} lignes identifiées. Finalisation...`);
                     
                     const processed = processData(rawData);
                     setPayments(processed);
@@ -177,17 +203,14 @@
                 } catch (err) {
                     console.error(err);
                     let msg = err.message;
-                    if (msg.includes('404') || msg.includes('not found')) {
-                        msg = `Le modèle "${selectedModel}" n'est pas disponible. Essayez d'en sélectionner un autre dans les réglages.`;
-                    } else if (msg.includes('403') || msg.includes('API key not valid')) {
-                        msg = "Clé API invalide ou restreinte. Vérifiez vos restrictions (Referrer/IP) sur Google Cloud Console.";
-                    }
+                    if (msg.includes('404')) msg = "Modèle introuvable. Changez de modèle dans les paramètres.";
+                    if (msg.includes('403')) msg = "Clé API invalide.";
                     setError(msg);
                     setStep('upload');
                 }
             };
 
-            // --- LOGIQUE METIER (Même logique que précédemment) ---
+            // --- LOGIQUE METIER (inchangée) ---
             const processData = (rawData) => {
                 const groups = {};
                 const nonLettresFactures = [];
@@ -293,7 +316,6 @@
 
             // --- RENDU ---
 
-            // ECRAN 1 : CLÉ API
             if (step === 'login') {
                 return (
                     <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white p-4">
@@ -303,7 +325,7 @@
                             </div>
                             <h1 className="text-2xl font-bold text-center mb-2">Smart Trésorerie</h1>
                             <p className="text-slate-400 text-center text-sm mb-6">
-                                Analyse automatique de Grands Livres PDF via Google Gemini AI.
+                                Analyse automatique via Google Gemini AI (Lecture Locale).
                             </p>
                             
                             <div className="mb-4">
@@ -336,16 +358,11 @@
                                 <Icons.Check className="w-5 h-5 mr-2" />
                                 Continuer
                             </button>
-                            
-                            <p className="mt-4 text-xs text-slate-500 text-center">
-                                La clé est stockée uniquement dans votre navigateur.
-                            </p>
                         </div>
                     </div>
                 );
             }
 
-            // ECRAN 2 : UPLOAD
             if (step === 'upload') {
                 return (
                     <div className="flex items-center justify-center min-h-screen p-4">
@@ -354,11 +371,9 @@
                                 <Icons.Upload className="w-10 h-10 text-indigo-600" />
                             </div>
                             <h2 className="text-2xl font-bold text-slate-800 mb-2">Analyser un Grand Livre</h2>
-                            <p className="text-slate-500 mb-2">
-                                Sélectionnez votre fichier PDF.
-                            </p>
-                            <p className="text-xs text-indigo-500 mb-8 font-medium bg-indigo-50 inline-block px-3 py-1 rounded-full">
-                                Modèle actif : {models.find(m => m.id === selectedModel)?.name || selectedModel}
+                            <p className="text-slate-500 mb-2">Sélectionnez votre fichier PDF.</p>
+                            <p className="text-xs text-indigo-500 mb-8 bg-indigo-50 inline-block px-3 py-1 rounded-full">
+                                Mode : Extraction texte locale + Analyse IA
                             </p>
 
                             {error && (
@@ -376,30 +391,27 @@
                             </label>
                             <button onClick={() => setStep('login')} className="mt-6 text-xs text-slate-400 hover:text-slate-600 underline flex items-center justify-center mx-auto">
                                 <Icons.Settings className="w-3 h-3 mr-1" />
-                                Changer de clé ou de modèle
+                                Paramètres
                             </button>
                         </div>
                     </div>
                 );
             }
 
-            // ECRAN 3 : CHARGEMENT
             if (step === 'analyzing') {
                 return (
                     <div className="flex flex-col items-center justify-center min-h-screen bg-slate-50">
                         <div className="animate-spin text-indigo-600 mb-4">
                             <Icons.Loader className="w-12 h-12" />
                         </div>
-                        <h2 className="text-xl font-semibold text-slate-800 animate-pulse">Analyse intelligente en cours...</h2>
+                        <h2 className="text-xl font-semibold text-slate-800 animate-pulse">Analyse en cours...</h2>
                         <p className="text-slate-500 mt-2 text-sm max-w-md text-center">{logs}</p>
                     </div>
                 );
             }
 
-            // ECRAN 4 : DASHBOARD (Rapport)
             return (
                 <div className="max-w-7xl mx-auto p-6">
-                    {/* Header Impression */}
                     <div className="print-only mb-8 border-b-2 border-slate-800 pb-4">
                         <div className="flex justify-between items-end">
                             <div>
@@ -413,7 +425,6 @@
                         </div>
                     </div>
 
-                    {/* Header Ecran */}
                     <div className="no-print flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
                         <div className="flex items-center space-x-3">
                             <div className="bg-indigo-600 p-2 rounded-lg text-white">
@@ -440,7 +451,6 @@
                         </div>
                     </div>
 
-                    {/* KPIs */}
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8 card-grid">
                         <div className="bg-white p-6 rounded-xl shadow-sm border border-indigo-100 break-inside-avoid">
                             <div className="flex items-center justify-between mb-4">
@@ -468,7 +478,6 @@
                         </div>
                     </div>
 
-                    {/* Tableau */}
                     <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden print:border-none print:shadow-none">
                         <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50 print:bg-transparent">
                             <h3 className="font-bold text-slate-700">Détail des Règlements</h3>
